@@ -14,7 +14,9 @@ This example performs object detection using a USB camera connected to a Hailo d
 
 \- Runs preprocessing, inference, and post-processing in separate threads
 
-\- Performs real-time object detection and draws bounding boxes on detected objects
+\- runs asynchronous inference using a YOLO `.hef` model
+
+\- draws bounding boxes and labels on detected objects
 
 \- Streams the processed video over UDP to another system
 
