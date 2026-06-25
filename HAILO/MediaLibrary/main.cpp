@@ -3,8 +3,6 @@
 #include <mutex>
 #include <string>
 
-#include "my_detection_stage.hpp"
-
 #include <gst/app/gstappsink.h>
 #include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
@@ -15,6 +13,7 @@
 #include "gsthailobuffermeta.hpp"
 
 #include "hailo_analytics/pipeline/core/pipeline_builder.hpp"
+#include "hailo_analytics/analytics/tiling.hpp"
 #include "hailo_analytics/pipeline/overlay/overlay_stage.hpp"
 #include "hailo_analytics/pipeline/sinks/gst_sink_stage.hpp"
 #include "hailo_analytics/pipeline/sources/gst_source_stage.hpp"
@@ -27,7 +26,7 @@
 #define NO_PROFILE_SELECTED ""
 #define TILING_PIPELINE "tiling_detection_pipeline"
 
-static constexpr const char *PIPELINE_NAME = "vision-analytics-encoder";
+static constexpr const char *PIPELINE_NAME = "detection_gstreamer";
 
 struct AppConfig
 {
@@ -36,6 +35,10 @@ struct AppConfig
     std::string host_ip;
     std::string switch_profile;
     int switch_delay;
+    std::string hef_path;
+    std::string post_so_path;
+    std::string post_function_name;
+    std::string label_json_path;
 };
 
 struct InputPipeline
@@ -51,15 +54,14 @@ struct OutputPipeline
     GstElement *appsrc;
 };
 
-
 static std::mutex g_stop_mutex;
-static std::condition_variable g_stop_cv; 
+static std::condition_variable g_stop_cv;
 static bool g_stop_requested = false;
 
 static void request_stop()
 {
     {
-        std::lock_guard<std::mutex> lock(g_stop_mutex); 
+        std::lock_guard<std::mutex> lock(g_stop_mutex);
         g_stop_requested = true;
     }
     g_stop_cv.notify_all();
@@ -117,15 +119,26 @@ static bool link_vision_stream(GstElement *vision, GstPadTemplate *templ, const 
 static bool parse_arguments(int argc, char *argv[], AppConfig &config)
 {
     cxxopts::Options options("GStreamer vision+detection+encoder pipeline");
-    options.add_options()("h,help", "Show this help")("t,timeout", "Time to run (seconds)",
-                                                      cxxopts::value<int>()->default_value("60"))(
-        "c,config-file-path", "Media library configuration path",
-        cxxopts::value<std::string>()->default_value(MEDIALIB_CONFIG_PATH))(
-        "o,host-ip", "Host IP address for UDP output", cxxopts::value<std::string>()->default_value(HOST_IP))(
-        "s,switch-profile", "Profile to switch to mid-run",
-        cxxopts::value<std::string>()->default_value(NO_PROFILE_SELECTED))(
-        "d,switch-delay", "Seconds before switching profile", cxxopts::value<int>()->default_value("10"));
-
+    options.add_options()
+    ("h,help", "Show this help")
+    ("t,timeout", "Time to run (seconds)",
+        cxxopts::value<int>()->default_value("60"))
+    ("c,config-file-path", "Media library configuration path",
+        cxxopts::value<std::string>()->default_value(MEDIALIB_CONFIG_PATH))
+    ("o,host-ip", "Host IP address for UDP output",
+        cxxopts::value<std::string>()->default_value(HOST_IP))
+    ("s,switch-profile", "Profile to switch to mid-run",
+        cxxopts::value<std::string>()->default_value(NO_PROFILE_SELECTED))
+    ("d,switch-delay", "Seconds before switching profile",
+        cxxopts::value<int>()->default_value("10"))
+    ("n,net", "Path to HEF file",
+        cxxopts::value<std::string>())
+    ("p,post-so", "Path to post-processing .so file",
+        cxxopts::value<std::string>())
+    ("f,post-func", "Post-processing function name",
+        cxxopts::value<std::string>())
+    ("l,label", "Path to label JSON file",
+        cxxopts::value<std::string>());
     auto result = options.parse(argc, argv);
     if (result.count("help"))
     {
@@ -144,12 +157,21 @@ static bool parse_arguments(int argc, char *argv[], AppConfig &config)
     config.host_ip = result["host-ip"].as<std::string>();
     config.switch_profile = result["switch-profile"].as<std::string>();
     config.switch_delay = result["switch-delay"].as<int>();
+    if (result.count("net"))
+        config.hef_path = result["net"].as<std::string>();
+    if (result.count("post-so"))
+        config.post_so_path = result["post-so"].as<std::string>();
+    if (result.count("post-func"))
+        config.post_function_name = result["post-func"].as<std::string>();
+    if (result.count("label"))
+        config.label_json_path = result["label"].as<std::string>();
     return true;
 }
 
 static bool build_input_pipeline(const AppConfig &config, InputPipeline &input)
 {
     input.pipeline = gst_pipeline_new(PIPELINE_NAME);
+
     input.vision = gst_element_factory_make("gsthailovision", "vision");
     if (!input.vision)
     {
@@ -243,36 +265,50 @@ static bool build_output_pipeline(const AppConfig &config, OutputPipeline &outpu
     return true;
 }
 
-static hailo_analytics::pipeline::PipelinePtr build_analytics_pipeline(
-    GstElement *appsink, GstElement *appsrc)
+static hailo_analytics::pipeline::PipelinePtr build_analytics_pipeline(GstElement *appsink, GstElement *appsrc, const AppConfig &config)
 {
     using namespace hailo_analytics::pipeline;
 
-    auto gst_source = sources::GstSourceStageBuild::create()
-        .set_stage_name("gst_source").buildptr();
+    auto gst_source = sources::GstSourceStageBuild::create().set_stage_name("gst_source").buildptr();
     gst_source->add_appsink(STREAM_ID_0, appsink);
 
-    auto my_detect = std::make_shared<MyDetectionStage>("my_detect", 4);
+    hailo_analytics::analytics::tiling::tiling_detection_config_t tiling_cfg;
+    if(!config.hef_path.empty())
+        tiling_cfg.detection_config.ai_config.hef_path = config.hef_path;
+    if(!config.post_so_path.empty())
+        tiling_cfg.detection_config.post_config.so_path = config.post_so_path;
+    if(!config.post_function_name.empty())
+        tiling_cfg.detection_config.post_config.function_name = config.post_function_name;
+    if(!config.label_json_path.empty())
+        tiling_cfg.detection_config.post_config.config_path = config.label_json_path;
+    auto tiling_pipeline_status =
+        hailo_analytics::analytics::tiling::generate_tiling_detection_pipeline(TILING_PIPELINE, tiling_cfg);
+    if (!tiling_pipeline_status.has_value())
+    {
+        std::cerr << "Failed to create tiling detection pipeline" << std::endl;
+        return nullptr;
+    }
+    auto tiling_pipeline = tiling_pipeline_status.value();
 
-    auto overlay = overlay::OverlayStageBuild::create()
-        .set_stage_name("overlay_stage")
-        .set_queue_size(3).buildptr();
+    auto overlay_stage =
+        overlay::OverlayStageBuild::create().set_stage_name("overlay_stage").set_queue_size(3).buildptr();
 
     auto gst_output = sinks::GstSinkStageBuild::create()
-        .set_stage_name("gst_output")
-        .set_queue_size_opt(2)
-        .set_leaky_opt(true).buildptr();
+                          .set_stage_name("gst_output")
+                          .set_queue_size_opt(2)
+                          .set_leaky_opt(true)
+                          .buildptr();
     gst_output->configure(appsrc);
 
     return PipelineBuilder()
         .add_stage(gst_source, StageType::SOURCE)
-        .add_stage(my_detect)                       
-        .add_stage(overlay)
+        .add_stage(tiling_pipeline)
+        .add_stage(overlay_stage)
         .add_stage(gst_output, StageType::SINK)
-        .connect_frontend("gst_source",STREAM_ID_0, "my_detect")
-        .connect("my_detect", "overlay_stage")
+        .connect_frontend("gst_source", STREAM_ID_0, TILING_PIPELINE)
+        .connect(TILING_PIPELINE, "overlay_stage")
         .connect("overlay_stage", "gst_output")
-        .build("custom_det_pipeline");
+        .build("analytics_pipeline");
 }
 
 static bool start_pipelines(InputPipeline &input, OutputPipeline &output,
@@ -357,7 +393,7 @@ int main(int argc, char *argv[])
 
     gst_init(&argc, &argv);
 
-    InputPipeline input{}; 
+    InputPipeline input{};
     if (!build_input_pipeline(config, input))
         return 1;
 
@@ -368,7 +404,7 @@ int main(int argc, char *argv[])
     add_bus_watch(input.pipeline);
     add_bus_watch(output.pipeline);
 
-    auto analytics = build_analytics_pipeline(input.appsink, output.appsrc);
+    auto analytics = build_analytics_pipeline(input.appsink, output.appsrc, config);
     if (!analytics)
     {
         gst_object_unref(input.pipeline);
